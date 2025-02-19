@@ -246,7 +246,26 @@ if __name__ == "__main__":
 
     model, tokenizer = init_model(lm_config)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
+    # 创建分布式采样器（如果使用DDP）或None（单机训练）
+    # 在DDP模式下，DistributedSampler确保：
+    # 1. 每个进程获得不同的数据子集，避免数据重复
+    # 2. 数据在多个epoch间正确打乱
+    # 3. 各进程间数据分布均衡
     train_sampler = DistributedSampler(train_ds) if ddp else None
+    
+    # 创建数据加载器
+    # 参数说明：
+    # - train_ds: 训练数据集
+    # - batch_size: 每个batch的大小
+    # - pin_memory=True: 将数据固定到GPU内存，加速CPU到GPU的数据传输
+    # - drop_last=False: 保留最后一个不完整的batch
+    # - shuffle=False: 禁用默认打乱，因为DistributedSampler会处理打乱
+    # - num_workers: 数据加载的线程数
+    # - sampler: 使用自定义采样器（DDP模式）或None（单机模式）
+    # 这样配置解决了：
+    # 1. 高效的数据加载和传输
+    # 2. DDP模式下的数据分布问题
+    # 3. 内存优化
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -257,13 +276,47 @@ if __name__ == "__main__":
         sampler=train_sampler
     )
 
+    # 初始化GradScaler用于混合精度训练
+    # 这一步解决了以下问题：
+    # 1. 数值稳定性：在float16/bfloat16精度下，梯度值可能过小导致下溢，GradScaler通过缩放损失值来避免这个问题
+    # 2. 训练效率：使用低精度计算可以加速训练过程，同时减少显存占用
+    # 3. 自动管理：GradScaler自动处理损失缩放和梯度反缩放，简化了混合精度训练的实现
+    # 4. 条件启用：根据用户指定的dtype参数决定是否启用混合精度训练
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+    
+    # 使用AdamW优化器初始化模型参数优化
+    # 这一步解决了以下问题：
+    # 1. 参数优化：AdamW结合了Adam优化器的自适应学习率和权重衰减，能够更有效地优化模型参数
+    # 2. 学习率控制：通过设置初始学习率，为模型训练提供合适的参数更新步长
+    # 3. 稳定性：AdamW的权重衰减实现更稳定，有助于防止过拟合
+    # 4. 收敛性：自适应学习率机制有助于模型更快地收敛到较好的解
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     if ddp:
+        # 设置需要忽略的分布式参数和缓冲区
+        # 这一步解决了以下问题：
+        # 1. 特殊参数处理：pos_cis是预计算的位置编码，在分布式训练中不需要同步
+        # 2. 性能优化：避免不必要的参数同步，提高分布式训练效率
+        # 3. 内存节省：减少分布式通信时的内存开销
+        # 4. 正确性保证：确保位置编码在分布式训练中保持一致
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
+        
+        # 将模型包装为分布式数据并行模型
+        # 这一步解决了以下问题：
+        # 1. 分布式训练：支持多GPU并行训练，加速模型训练过程
+        # 2. 数据并行：自动将数据分割到不同GPU，实现并行计算
+        # 3. 梯度同步：自动处理不同GPU间的梯度同步，确保参数更新一致
+        # 4. 设备管理：指定模型运行的GPU设备，确保资源合理分配
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
+    # 计算每个epoch的迭代次数
+    # 这一步解决了以下问题：
+    # 1. 训练进度跟踪：通过知道每个epoch的总迭代次数，可以准确计算和显示训练进度
+    # 2. 学习率调度：在余弦退火等学习率调度策略中，需要知道总步数来正确计算当前学习率
+    # 3. 日志记录：在记录训练日志时，可以显示当前step在总迭代次数中的位置
+    # 4. 时间预估：结合已用时间，可以估算完成一个epoch或整个训练所需的时间
+    # 5. 检查点保存：根据总迭代次数，可以确定在哪些step保存模型检查点
     iter_per_epoch = len(train_loader)
+    
     for epoch in range(args.epochs):
         train_epoch(epoch, wandb)
