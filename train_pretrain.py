@@ -62,6 +62,8 @@ def train_epoch(epoch, wandb):
             param_group['lr'] = lr
 
         with ctx:
+            # 前向传播
+            #    model(X) → 触发 __call__ → 执行 forward → 返回计算结果
             res = model(X)
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
@@ -71,16 +73,31 @@ def train_epoch(epoch, wandb):
             loss += res.aux_loss
             loss = loss / args.accumulation_steps
 
+        # 使用GradScaler进行损失缩放和反向传播
+        # 这一步解决了以下问题：
+        # 1. 混合精度训练：在float16/bfloat16精度下，数值范围较小，直接计算梯度可能导致下溢
+        # 2. 梯度稳定性：通过缩放损失值，确保梯度在合理范围内，避免梯度爆炸或消失
+        # 3. 训练效率：在保持数值稳定性的同时，利用低精度计算加速训练过程
+        # 4. 内存优化：使用低精度计算减少显存占用，允许使用更大的batch size
+        # 5. 自动管理：GradScaler自动处理损失缩放和梯度反缩放，简化了混合精度训练的实现
         scaler.scale(loss).backward()
 
+        # 当达到梯度累积步数时执行以下操作
+        # 这一步解决了以下问题：
+        # 1. 梯度累积：通过累积多个小batch的梯度来模拟大batch训练，解决显存不足的问题
+        # 2. 梯度反缩放：在混合精度训练中，将缩放后的梯度还原为原始值，确保优化器更新参数的正确性
+        # 3. 梯度裁剪：防止梯度爆炸，通过clip_grad_norm_将梯度范数限制在合理范围内，提高训练稳定性
+        # 4. 参数更新：使用优化器更新模型参数，实现模型的学习和优化
+        # 5. 缩放因子更新：根据梯度情况调整缩放因子，确保混合精度训练的数值稳定性
+        # 6. 梯度清零：高效地清除梯度，为下一轮梯度计算做准备，set_to_none=True可以减少内存分配开销
         if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.unscale_(optimizer)  # 反缩放梯度
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # 梯度裁剪
 
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.step(optimizer)  # 更新模型参数
+            scaler.update()  # 更新缩放因子
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)  # 清除梯度
 
         if step % args.log_interval == 0:
             spend_time = time.time() - start_time
